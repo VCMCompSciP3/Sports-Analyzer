@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Sports Clip Analyzer</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div class="container">
+
+    <h1>Sports Clip Analyzer</h1>
+
+    <div class="upload-section">
+        <input type="file" id="videoInput" accept="video/*">
+        <button id="analyzeBtn">Analyze Clip</button>
+    </div>
+
+    <div class="content">
+        <video id="preview" controls></video>
+
+        <div class="results">
+            <h2>Analysis Results</h2>
+            <pre id="output">Upload a clip to begin.</pre>
+        </div>
+    </div>
+
+</div>
+
+<script src="/static/script.js"></script>
+</body>
+</html>
