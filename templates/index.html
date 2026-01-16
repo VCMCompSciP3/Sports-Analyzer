@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Sports Clip Analyzer</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div class="card">
+    <h1>Sports Clip Analyzer</h1>
+
+    <p class="subtitle">Upload a sports video and let AI identify the game, teams, and date.</p>
+
+    <div class="upload-box">
+        <input type="file" id="videoInput" accept="video/*">
+        <button id="analyzeBtn">Analyze Video</button>
+    </div>
+
+    <video id="preview" controls></video>
+
+    <div class="results">
+        <h2>Analysis</h2>
+        <pre id="output">No video analyzed yet.</pre>
+    </div>
+</div>
+
+<script src="/static/script.js"></script>
+</body>
+</html>

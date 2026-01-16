@@ -10,12 +10,15 @@ videoInput.onchange = () => {
 
 analyzeBtn.onclick = async () => {
     const file = videoInput.files[0];
-    if (!file) return alert("Upload a video first");
+    if (!file) {
+        alert("Please upload a video first.");
+        return;
+    }
+
+    output.textContent = "Analyzing video... please wait.";
 
     const form = new FormData();
     form.append("video", file);
-
-    output.textContent = "Analyzing...";
 
     const res = await fetch("/analyze", {
         method: "POST",

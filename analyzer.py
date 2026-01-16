@@ -1,13 +1,14 @@
 import cv2
-from google import genai
+import google.genai as genai
+from google.genai.types import Content, Part
 import base64
 import json
 
-client = genai.Client(api_key="YOUR_API_KEY")
+client = genai.Client(api_key="AIzaSyBX1pbt2-NSAdfhl0n344hoFGtaqdy3o2o")
 
 def extract_frames(path, interval=30):
     vid = cv2.VideoCapture(path)
-    frames = []
+    frames = []    
     i = 0
     while True:
         ret, frame = vid.read()
@@ -19,35 +20,55 @@ def extract_frames(path, interval=30):
         i += 1
     return frames
 
+
 def analyze_frame(image_bytes):
     prompt = """
     You are analyzing a sports broadcast frame.
-    Extract:
+    Extract the following if visible:
     - sport
     - league
     - teams
+    - players
+    - scoreboard_text
+    - quarter_or_period
+    - time_remaining
     - event_type
     - game_number
+    - arena
     - approximate_date
-    - reasoning
     Return JSON only.
     """
 
     response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=[prompt, image_bytes]
+        model="gemini-2.0-pro",
+        contents=[
+            Content(
+                role="user",
+                parts=[
+                    Part.text(prompt),
+                    Part.inline_data(
+                        mime_type="image/jpeg",
+                        data=image_bytes
+                    )
+                ]
+            )
+        ]
     )
 
     try:
         return json.loads(response.text)
-    except:
-        return {"error": "Invalid JSON returned"}
+    except Exception as e:
+        return {
+            "error": f"Invalid JSON: {e}",
+            "raw": response.text
+        }
+
 
 def analyze_video(path):
     frames = extract_frames(path)
     results = []
 
-    for f in frames[:10]:  # limit for speed
+    for f in frames[:30]:  # limit for speed
         results.append(analyze_frame(f))
 
     # Simple aggregation
