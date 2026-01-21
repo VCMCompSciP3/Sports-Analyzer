@@ -40,18 +40,15 @@ def analyze_frame(image_bytes):
     """
 
     response = client.models.generate_content(
-        model="gemini-2.0-pro",
+        model="gemini-2.5-flash",
         contents=[
-            Content(
-                role="user",
-                parts=[
-                    Part.text(prompt),
-                    Part.inline_data(
-                        mime_type="image/jpeg",
-                        data=image_bytes
-                    )
-                ]
-            )
+            {"text": prompt},
+            {
+                "inline_data": {
+                    "mime_type": "image/jpeg",
+                    "data": image_bytes
+                }
+            }
         ]
     )
 
@@ -62,6 +59,8 @@ def analyze_frame(image_bytes):
             "error": f"Invalid JSON: {e}",
             "raw": response.text
         }
+
+
 
 
 def analyze_video(path):
