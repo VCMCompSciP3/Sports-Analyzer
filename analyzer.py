@@ -2,13 +2,13 @@ import cv2
 import json
 from google import genai
 
-client = genai.Client(api_key="AIzaSyAyceuBbLUUxPMIm4q47OE5ZYWbH3pCf-c")
+client = genai.Client(api_key="AIzaSyCpNsoSY5MPREYz5cIfi5snen0Q25Bnlew")
 
 
 # ---------------------------------------------------------
-# FRAME EXTRACTION
+# FRAME EXTRACTION (1 frame every ~2 seconds)
 # ---------------------------------------------------------
-def extract_frames(path, sample_rate=10):
+def extract_frames(path, sample_rate=60):
     """
     Extract frames every `sample_rate` frames.
     Returns a list of JPEG byte arrays.
@@ -34,41 +34,40 @@ def extract_frames(path, sample_rate=10):
 
 
 # ---------------------------------------------------------
-# GEMINI FRAME ANALYSIS
+# BATCHED GEMINI ANALYSIS (10 frames per request)
 # ---------------------------------------------------------
-def analyze_frame(image_bytes):
-    print("Frame size:", len(image_bytes))
-
+def analyze_batch(frames):
+    """
+    Analyze up to 10 frames in a single Gemini request.
+    """
     prompt = """
-    You are analyzing a sports broadcast frame.
-    If you are not sure about something, make your best guess.
-    Return JSON with these fields, even if uncertain:
+    You are analyzing sports broadcast frames.
+    For EACH frame, return a JSON object with:
     sport, league, teams, players, scoreboard_text,
     event_type, game_number, approximate_date.
+    If unsure, make your best guess.
+    Return a JSON list with one object per frame.
     """
+
+    contents = [{"text": prompt}]
+
+    for frame in frames:
+        contents.append({
+            "inline_data": {
+                "mime_type": "image/jpeg",
+                "data": frame
+            }
+        })
 
     response = client.models.generate_content(
         model="gemini-2.5-flash",
-        contents=[
-            {"text": prompt},
-            {
-                "inline_data": {
-                    "mime_type": "image/jpeg",
-                    "data": image_bytes
-                }
-            }
-        ]
+        contents=contents
     )
-
-    print("RAW RESPONSE:", response.text)
 
     try:
         return json.loads(response.text)
     except Exception as e:
-        return {
-            "error": f"Invalid JSON: {e}",
-            "raw": response.text
-        }
+        return [{"error": f"Invalid JSON: {e}", "raw": response.text}]
 
 
 # ---------------------------------------------------------
@@ -94,14 +93,15 @@ def aggregate_results(results):
         "event_type": None,
         "game_number": None,
         "approximate_date": None,
-        "frames_analyzed": len(results)
+        "frames_analyzed": 0
     }
 
     for r in results:
+        summary["frames_analyzed"] += 1
+
         if not isinstance(r, dict):
             continue
 
-        # Simple fields
         safe_set(summary, "sport", r.get("sport"))
         safe_set(summary, "league", r.get("league"))
         safe_set(summary, "event_type", r.get("event_type"))
@@ -122,7 +122,6 @@ def aggregate_results(results):
                 if p and p not in ["unknown", "none", "null"]:
                     summary["players"].add(str(p))
 
-    # Convert sets to lists
     summary["teams"] = list(summary["teams"])
     summary["players"] = list(summary["players"])
 
@@ -130,14 +129,26 @@ def aggregate_results(results):
 
 
 # ---------------------------------------------------------
-# MAIN VIDEO ANALYSIS PIPELINE
+# MAIN VIDEO ANALYSIS PIPELINE (FAST)
 # ---------------------------------------------------------
 def analyze_video(path):
-    frames = extract_frames(path, sample_rate=10)
+    frames = extract_frames(path, sample_rate=60)  # 1 frame every ~2 seconds
     results = []
 
-    for frame in frames:
-        results.append(analyze_frame(frame))
+    # Process in batches of 10 frames
+    for i in range(0, len(frames), 10):
+        batch = frames[i:i+10]
+        batch_results = analyze_batch(batch)
+        results.extend(batch_results)
+
+        # EARLY STOPPING: once we know the sport, league, and both teams
+        temp_summary = aggregate_results(results)
+        if (
+            temp_summary["sport"] and
+            temp_summary["league"] and
+            len(temp_summary["teams"]) >= 2
+        ):
+            break
 
     final_summary = aggregate_results(results)
     return final_summary
