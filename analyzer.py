@@ -1,154 +1,174 @@
 import cv2
 import json
-from google import genai
+import re
+from google.cloud import vision
 
-client = genai.Client(api_key="AIzaSyCpNsoSY5MPREYz5cIfi5snen0Q25Bnlew")
+# Initialize Vision API client
+client = vision.ImageAnnotatorClient()
 
 
 # ---------------------------------------------------------
-# FRAME EXTRACTION (1 frame every ~2 seconds)
+# FRAME EXTRACTION — FIRST 10 FRAMES
 # ---------------------------------------------------------
-def extract_frames(path, sample_rate=60):
-    """
-    Extract frames every `sample_rate` frames.
-    Returns a list of JPEG byte arrays.
-    """
+def extract_frames(path, max_frames=10):
     vid = cv2.VideoCapture(path)
     frames = []
-    frame_count = 0
+    count = 0
 
-    while True:
+    while len(frames) < max_frames:
         ret, frame = vid.read()
         if not ret:
             break
 
-        if frame_count % sample_rate == 0:
-            success, buf = cv2.imencode(".jpg", frame)
-            if success:
-                frames.append(buf.tobytes())
+        ok, buf = cv2.imencode(".jpg", frame)
+        if ok:
+            frames.append(buf.tobytes())
 
-        frame_count += 1
+        count += 1
 
     vid.release()
     return frames
 
 
 # ---------------------------------------------------------
-# BATCHED GEMINI ANALYSIS (10 frames per request)
+# SEND FRAME TO VISION API (OCR + LOGO DETECTION)
 # ---------------------------------------------------------
-def analyze_batch(frames):
-    """
-    Analyze up to 10 frames in a single Gemini request.
-    """
-    prompt = """
-    You are analyzing sports broadcast frames.
-    For EACH frame, return a JSON object with:
-    sport, league, teams, players, scoreboard_text,
-    event_type, game_number, approximate_date.
-    If unsure, make your best guess.
-    Return a JSON list with one object per frame.
-    """
+def analyze_frame(image_bytes):
+    image = vision.Image(content=image_bytes)
 
-    contents = [{"text": prompt}]
+    response = client.annotate_image({
+        "image": image,
+        "features": [
+            {"type": vision.Feature.Type.TEXT_DETECTION},
+            {"type": vision.Feature.Type.LOGO_DETECTION}
+        ]
+    })
 
-    for frame in frames:
-        contents.append({
-            "inline_data": {
-                "mime_type": "image/jpeg",
-                "data": frame
-            }
-        })
+    text = ""
+    logos = []
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=contents
-    )
+    if response.text_annotations:
+        text = response.text_annotations[0].description
 
-    try:
-        return json.loads(response.text)
-    except Exception as e:
-        return [{"error": f"Invalid JSON: {e}", "raw": response.text}]
+    if response.logo_annotations:
+        logos = [logo.description for logo in response.logo_annotations]
+
+    return {
+        "text": text,
+        "logos": logos
+    }
 
 
 # ---------------------------------------------------------
-# AGGREGATION HELPERS
+# PARSE TEXT TO EXTRACT SPORTS INFO
 # ---------------------------------------------------------
-def safe_set(summary, key, value):
-    """
-    Only set a field if the value is meaningful.
-    """
-    if value and value not in ["unknown", "none", "null", [], {}, "N/A"]:
-        summary[key] = value
+def parse_frame_data(text, logos):
+    text_lower = text.lower()
+
+    sport = None
+    league = None
+    event_type = None
+    game_number = None
+    approximate_date = None
+    teams = set()
+
+    # SPORT
+    if "nba" in text_lower or "finals" in text_lower:
+        sport = "Basketball"
+        league = "NBA"
+
+    # TEAMS (simple keyword matching)
+    team_keywords = {
+        "warriors": "Golden State Warriors",
+        "cavaliers": "Cleveland Cavaliers",
+        "cavs": "Cleveland Cavaliers",
+        "gsw": "Golden State Warriors",
+        "cle": "Cleveland Cavaliers",
+        "lakers": "Los Angeles Lakers",
+        "heat": "Miami Heat",
+        "bulls": "Chicago Bulls"
+    }
+
+    for key, name in team_keywords.items():
+        if key in text_lower:
+            teams.add(name)
+        for logo in logos:
+            if key in logo.lower():
+                teams.add(name)
+
+    # EVENT TYPE
+    if "finals" in text_lower:
+        event_type = "NBA Finals"
+    if "game 7" in text_lower:
+        game_number = 7
+    elif "game" in text_lower:
+        match = re.search(r"game\s+(\d+)", text_lower)
+        if match:
+            game_number = int(match.group(1))
+
+    # DATE (very rough)
+    if "2016" in text_lower:
+        approximate_date = "2016"
+    if "2015" in text_lower:
+        approximate_date = "2015"
+
+    return {
+        "sport": sport,
+        "league": league,
+        "teams": list(teams),
+        "event_type": event_type,
+        "game_number": game_number,
+        "approximate_date": approximate_date
+    }
 
 
 # ---------------------------------------------------------
-# AGGREGATE RESULTS ACROSS ALL FRAMES
+# AGGREGATE RESULTS ACROSS FRAMES
 # ---------------------------------------------------------
 def aggregate_results(results):
     summary = {
         "sport": None,
         "league": None,
         "teams": set(),
-        "players": set(),
         "event_type": None,
         "game_number": None,
         "approximate_date": None,
-        "frames_analyzed": 0
+        "frames_analyzed": len(results)
     }
 
     for r in results:
-        summary["frames_analyzed"] += 1
+        if r["sport"] and not summary["sport"]:
+            summary["sport"] = r["sport"]
 
-        if not isinstance(r, dict):
-            continue
+        if r["league"] and not summary["league"]:
+            summary["league"] = r["league"]
 
-        safe_set(summary, "sport", r.get("sport"))
-        safe_set(summary, "league", r.get("league"))
-        safe_set(summary, "event_type", r.get("event_type"))
-        safe_set(summary, "game_number", r.get("game_number"))
-        safe_set(summary, "approximate_date", r.get("approximate_date"))
+        for t in r["teams"]:
+            summary["teams"].add(t)
 
-        # Teams
-        teams = r.get("teams")
-        if teams and isinstance(teams, list):
-            for t in teams:
-                if t and t not in ["unknown", "none", "null"]:
-                    summary["teams"].add(str(t))
+        if r["event_type"] and not summary["event_type"]:
+            summary["event_type"] = r["event_type"]
 
-        # Players
-        players = r.get("players")
-        if players and isinstance(players, list):
-            for p in players:
-                if p and p not in ["unknown", "none", "null"]:
-                    summary["players"].add(str(p))
+        if r["game_number"] and not summary["game_number"]:
+            summary["game_number"] = r["game_number"]
+
+        if r["approximate_date"] and not summary["approximate_date"]:
+            summary["approximate_date"] = r["approximate_date"]
 
     summary["teams"] = list(summary["teams"])
-    summary["players"] = list(summary["players"])
-
     return summary
 
 
 # ---------------------------------------------------------
-# MAIN VIDEO ANALYSIS PIPELINE (FAST)
+# MAIN VIDEO ANALYSIS PIPELINE
 # ---------------------------------------------------------
 def analyze_video(path):
-    frames = extract_frames(path, sample_rate=60)  # 1 frame every ~2 seconds
-    results = []
+    frames = extract_frames(path, max_frames=10)
 
-    # Process in batches of 10 frames
-    for i in range(0, len(frames), 10):
-        batch = frames[i:i+10]
-        batch_results = analyze_batch(batch)
-        results.extend(batch_results)
+    frame_results = []
+    for frame in frames:
+        raw = analyze_frame(frame)
+        parsed = parse_frame_data(raw["text"], raw["logos"])
+        frame_results.append(parsed)
 
-        # EARLY STOPPING: once we know the sport, league, and both teams
-        temp_summary = aggregate_results(results)
-        if (
-            temp_summary["sport"] and
-            temp_summary["league"] and
-            len(temp_summary["teams"]) >= 2
-        ):
-            break
-
-    final_summary = aggregate_results(results)
-    return final_summary
+    return aggregate_results(frame_results)
