@@ -1,19 +1,26 @@
 import cv2
+import base64
 import json
-import re
-from google.cloud import vision
+from collections import Counter, defaultdict
+import vertexai
+from vertexai.preview.generative_models import GenerativeModel
 
-# Initialize Vision API client
-client = vision.ImageAnnotatorClient()
+# ---------------------------------------------------------
+# INITIALIZE VERTEX AI
+# ---------------------------------------------------------
+# Make sure GOOGLE_APPLICATION_CREDENTIALS is set in your environment
+# and that the project/location match your GCP setup.
+vertexai.init(project="compscigeminiproject", location="us-central1")
+model = GenerativeModel("gemini-1.5-flash")
 
 
 # ---------------------------------------------------------
-# FRAME EXTRACTION — FIRST 10 FRAMES
+# FRAME EXTRACTION
 # ---------------------------------------------------------
-def extract_frames(path, max_frames=10):
+def extract_frames(path, max_frames=6):
     vid = cv2.VideoCapture(path)
     frames = []
-    count = 0
+    total = 0
 
     while len(frames) < max_frames:
         ret, frame = vid.read()
@@ -24,138 +31,190 @@ def extract_frames(path, max_frames=10):
         if ok:
             frames.append(buf.tobytes())
 
-        count += 1
+        total += 1
 
     vid.release()
     return frames
 
 
 # ---------------------------------------------------------
-# SEND FRAME TO VISION API (OCR + LOGO DETECTION)
+# SINGLE FRAME ANALYSIS WITH VERTEX AI
 # ---------------------------------------------------------
-def analyze_frame(image_bytes):
-    image = vision.Image(content=image_bytes)
+def analyze_frame_with_vertex(image_bytes):
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-    response = client.annotate_image({
-        "image": image,
-        "features": [
-            {"type": vision.Feature.Type.TEXT_DETECTION},
-            {"type": vision.Feature.Type.LOGO_DETECTION}
+    prompt = """
+You are a world-class sports broadcast analysis AI.
+
+You are given a single frame from a sports broadcast.
+Analyze the image and extract as much structured information as possible.
+
+Return a JSON object with the following fields:
+
+- sport
+- league
+- teams
+- event_type
+- game_number
+- approximate_year
+- score
+- arena_or_location
+- broadcaster
+- series_status
+- home_team
+- away_team
+- star_players
+- notable_players_with_numbers
+- additional_context
+
+Rules:
+- Infer when needed.
+- Never return null.
+- Always return valid JSON.
+"""
+
+    response = model.generate_content(
+        [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": b64
+                        }
+                    }
+                ]
+            }
         ]
-    })
+    )
 
-    text = ""
-    logos = []
+    try:
+        data = json.loads(response.text)
+    except Exception:
+        data = {"additional_context": response.text}
 
-    if response.text_annotations:
-        text = response.text_annotations[0].description
+    return data
 
-    if response.logo_annotations:
-        logos = [logo.description for logo in response.logo_annotations]
-
-    return {
-        "text": text,
-        "logos": logos
-    }
-
-
-# ---------------------------------------------------------
-# PARSE TEXT TO EXTRACT SPORTS INFO
-# ---------------------------------------------------------
-def parse_frame_data(text, logos):
-    text_lower = text.lower()
-
-    sport = None
-    league = None
-    event_type = None
-    game_number = None
-    approximate_date = None
-    teams = set()
-
-    # SPORT
-    if "nba" in text_lower or "finals" in text_lower:
-        sport = "Basketball"
-        league = "NBA"
-
-    # TEAMS (simple keyword matching)
-    team_keywords = {
-        "warriors": "Golden State Warriors",
-        "cavaliers": "Cleveland Cavaliers",
-        "cavs": "Cleveland Cavaliers",
-        "gsw": "Golden State Warriors",
-        "cle": "Cleveland Cavaliers",
-        "lakers": "Los Angeles Lakers",
-        "heat": "Miami Heat",
-        "bulls": "Chicago Bulls"
-    }
-
-    for key, name in team_keywords.items():
-        if key in text_lower:
-            teams.add(name)
-        for logo in logos:
-            if key in logo.lower():
-                teams.add(name)
-
-    # EVENT TYPE
-    if "finals" in text_lower:
-        event_type = "NBA Finals"
-    if "game 7" in text_lower:
-        game_number = 7
-    elif "game" in text_lower:
-        match = re.search(r"game\s+(\d+)", text_lower)
-        if match:
-            game_number = int(match.group(1))
-
-    # DATE (very rough)
-    if "2016" in text_lower:
-        approximate_date = "2016"
-    if "2015" in text_lower:
-        approximate_date = "2015"
-
-    return {
-        "sport": sport,
-        "league": league,
-        "teams": list(teams),
-        "event_type": event_type,
-        "game_number": game_number,
-        "approximate_date": approximate_date
-    }
 
 
 # ---------------------------------------------------------
 # AGGREGATE RESULTS ACROSS FRAMES
 # ---------------------------------------------------------
-def aggregate_results(results):
+def aggregate_frame_results(frame_results):
+    """
+    Combine multiple frame-level JSON results into a single summary.
+    We use majority voting / most frequent values where possible.
+    """
+    if not frame_results:
+        return {
+            "sport": "unknown",
+            "league": "unknown",
+            "teams": [],
+            "event_type": "unknown",
+            "game_number": "unknown",
+            "approximate_year": "unknown",
+            "score": "unknown",
+            "arena_or_location": "unknown",
+            "broadcaster": "unknown",
+            "series_status": "unknown",
+            "home_team": "unknown",
+            "away_team": "unknown",
+            "star_players": [],
+            "notable_players_with_numbers": [],
+            "additional_context": "",
+            "frames_analyzed": 0
+        }
+
+    # Helper to pick most common non-"unknown" value
+    def most_common(values):
+        filtered = [v for v in values if v and v != "unknown"]
+        if not filtered:
+            return "unknown"
+        return Counter(filtered).most_common(1)[0][0]
+
+    # Collect fields
+    sports = []
+    leagues = []
+    event_types = []
+    game_numbers = []
+    years = []
+    scores = []
+    arenas = []
+    broadcasters = []
+    series_statuses = []
+    home_teams = []
+    away_teams = []
+    all_teams = []
+    all_star_players = []
+    all_notable_players = []
+    all_context = []
+
+    for r in frame_results:
+        sports.append(r.get("sport", "unknown"))
+        leagues.append(r.get("league", "unknown"))
+        event_types.append(r.get("event_type", "unknown"))
+        game_numbers.append(r.get("game_number", "unknown"))
+        years.append(r.get("approximate_year", "unknown"))
+        scores.append(r.get("score", "unknown"))
+        arenas.append(r.get("arena_or_location", "unknown"))
+        broadcasters.append(r.get("broadcaster", "unknown"))
+        series_statuses.append(r.get("series_status", "unknown"))
+        home_teams.append(r.get("home_team", "unknown"))
+        away_teams.append(r.get("away_team", "unknown"))
+
+        teams = r.get("teams", [])
+        if isinstance(teams, list):
+            all_teams.extend(teams)
+
+        stars = r.get("star_players", [])
+        if isinstance(stars, list):
+            all_star_players.extend(stars)
+
+        notable = r.get("notable_players_with_numbers", [])
+        if isinstance(notable, list):
+            all_notable_players.extend(notable)
+
+        ctx = r.get("additional_context", "")
+        if ctx:
+            all_context.append(ctx)
+
+    # Deduplicate teams and players
+    unique_teams = sorted(set([t for t in all_teams if t]))
+    unique_star_players = sorted(set([p for p in all_star_players if p]))
+
+    # For notable players, dedupe by (name, jersey_number, team)
+    seen_notable = set()
+    dedup_notable = []
+    for p in all_notable_players:
+        name = p.get("name", "unknown")
+        num = p.get("jersey_number", "unknown")
+        team = p.get("team", "unknown")
+        key = (name, num, team)
+        if key not in seen_notable:
+            seen_notable.add(key)
+            dedup_notable.append(p)
+
     summary = {
-        "sport": None,
-        "league": None,
-        "teams": set(),
-        "event_type": None,
-        "game_number": None,
-        "approximate_date": None,
-        "frames_analyzed": len(results)
+        "sport": most_common(sports),
+        "league": most_common(leagues),
+        "teams": unique_teams,
+        "event_type": most_common(event_types),
+        "game_number": most_common(game_numbers),
+        "approximate_year": most_common(years),
+        "score": most_common(scores),
+        "arena_or_location": most_common(arenas),
+        "broadcaster": most_common(broadcasters),
+        "series_status": most_common(series_statuses),
+        "home_team": most_common(home_teams),
+        "away_team": most_common(away_teams),
+        "star_players": unique_star_players,
+        "notable_players_with_numbers": dedup_notable,
+        "additional_context": " ".join(all_context),
+        "frames_analyzed": len(frame_results)
     }
 
-    for r in results:
-        if r["sport"] and not summary["sport"]:
-            summary["sport"] = r["sport"]
-
-        if r["league"] and not summary["league"]:
-            summary["league"] = r["league"]
-
-        for t in r["teams"]:
-            summary["teams"].add(t)
-
-        if r["event_type"] and not summary["event_type"]:
-            summary["event_type"] = r["event_type"]
-
-        if r["game_number"] and not summary["game_number"]:
-            summary["game_number"] = r["game_number"]
-
-        if r["approximate_date"] and not summary["approximate_date"]:
-            summary["approximate_date"] = r["approximate_date"]
-
-    summary["teams"] = list(summary["teams"])
     return summary
 
 
@@ -163,12 +222,12 @@ def aggregate_results(results):
 # MAIN VIDEO ANALYSIS PIPELINE
 # ---------------------------------------------------------
 def analyze_video(path):
-    frames = extract_frames(path, max_frames=10)
+    frames = extract_frames(path, max_frames=6)
 
     frame_results = []
     for frame in frames:
-        raw = analyze_frame(frame)
-        parsed = parse_frame_data(raw["text"], raw["logos"])
-        frame_results.append(parsed)
+        data = analyze_frame_with_vertex(frame)
+        frame_results.append(data)
 
-    return aggregate_results(frame_results)
+    summary = aggregate_frame_results(frame_results)
+    return summary
