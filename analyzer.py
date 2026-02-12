@@ -1,17 +1,17 @@
 import cv2
 import base64
 import json
-from collections import Counter, defaultdict
+import re
 import vertexai
 from vertexai.preview.generative_models import GenerativeModel
 
 # ---------------------------------------------------------
 # INITIALIZE VERTEX AI
 # ---------------------------------------------------------
-# Make sure GOOGLE_APPLICATION_CREDENTIALS is set in your environment
-# and that the project/location match your GCP setup.
-vertexai.init(project="compscigeminiproject", location="us-central1")
-model = GenerativeModel("gemini-1.5-flash")
+vertexai.init(project="compscigeminiproject", location="us-east1")
+
+MODEL_NAME = "gemini-2.5-pro"
+model = GenerativeModel(MODEL_NAME)
 
 
 # ---------------------------------------------------------
@@ -19,203 +19,141 @@ model = GenerativeModel("gemini-1.5-flash")
 # ---------------------------------------------------------
 def extract_frames(path, max_frames=6):
     vid = cv2.VideoCapture(path)
-    frames = []
-    total = 0
+    total_frames = int(vid.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    while len(frames) < max_frames:
+    if total_frames == 0:
+        return []
+
+    step = max(total_frames // max_frames, 1)
+    frames = []
+
+    for i in range(0, total_frames, step):
+        vid.set(cv2.CAP_PROP_POS_FRAMES, i)
         ret, frame = vid.read()
         if not ret:
-            break
+            continue
 
         ok, buf = cv2.imencode(".jpg", frame)
         if ok:
             frames.append(buf.tobytes())
 
-        total += 1
+        if len(frames) >= max_frames:
+            break
 
     vid.release()
     return frames
 
 
 # ---------------------------------------------------------
-# SINGLE FRAME ANALYSIS WITH VERTEX AI
+# CLEAN JSON EXTRACTION
 # ---------------------------------------------------------
-def analyze_frame_with_vertex(image_bytes):
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
+def extract_json_from_response(text):
+    """
+    Gemini often returns JSON inside ```json ... ``` blocks.
+    This extracts the inner JSON cleanly.
+    """
+
+    # 1. Try to extract JSON inside code fences
+    fenced = re.findall(r"```json(.*?)```", text, re.DOTALL)
+    if fenced:
+        candidate = fenced[0].strip()
+        try:
+            return json.loads(candidate)
+        except:
+            pass
+
+    # 2. Try to extract ANY JSON object in the text
+    obj = re.findall(r"\{.*\}", text, re.DOTALL)
+    if obj:
+        try:
+            return json.loads(obj[0])
+        except:
+            pass
+
+    # 3. If all else fails, return fallback
+    return {
+        "sport": "unknown",
+        "league": "unknown",
+        "teams": [],
+        "event_type": "unknown",
+        "game_number": "unknown",
+        "approximate_year": "unknown",
+        "score": "unknown",
+        "arena_or_location": "unknown",
+        "broadcaster": "unknown",
+        "series_status": "unknown",
+        "home_team": "unknown",
+        "away_team": "unknown",
+        "star_players": [],
+        "notable_players_with_numbers": [],
+        "additional_context": text.strip()
+    }
+
+
+# ---------------------------------------------------------
+# MULTI-FRAME ANALYSIS
+# ---------------------------------------------------------
+def analyze_frames_with_vertex(frames):
+    if not frames:
+        return {"error": "No frames extracted"}
+
+    parts = []
 
     prompt = """
 You are a world-class sports broadcast analysis AI.
 
-You are given a single frame from a sports broadcast.
-Analyze the image and extract as much structured information as possible.
+You will receive multiple frames from the SAME sports broadcast.
+Use ALL frames together to infer the most likely structured information.
 
-Return a JSON object with the following fields:
+Return ONLY valid JSON with the following fields:
 
-- sport
-- league
-- teams
-- event_type
-- game_number
-- approximate_year
-- score
-- arena_or_location
-- broadcaster
-- series_status
-- home_team
-- away_team
-- star_players
-- notable_players_with_numbers
-- additional_context
+{
+  "sport": "...",
+  "league": "...",
+  "teams": ["...", "..."],
+  "event_type": "...",
+  "game_number": "...",
+  "approximate_year": "...",
+  "score": "...",
+  "arena_or_location": "...",
+  "broadcaster": "...",
+  "series_status": "...",
+  "home_team": "...",
+  "away_team": "...",
+  "star_players": ["..."],
+  "notable_players_with_numbers": [
+      {"name": "...", "jersey_number": "...", "team": "..."}
+  ],
+  "additional_context": "..."
+}
 
 Rules:
-- Infer when needed.
-- Never return null.
-- Always return valid JSON.
+- NEVER return null.
+- NEVER return empty objects.
+- If unsure, infer the most likely value.
+- Use jersey colors, logos, court/field design, scoreboard layout, and player silhouettes.
+- ALWAYS return valid JSON.
 """
 
-    response = model.generate_content(
-        [
-            {
-                "role": "user",
-                "parts": [
-                    {"text": prompt},
-                    {
-                        "inline_data": {
-                            "mime_type": "image/jpeg",
-                            "data": b64
-                        }
-                    }
-                ]
+    parts.append({"text": prompt})
+
+    # Add all frames
+    for img in frames:
+        b64 = base64.b64encode(img).decode("utf-8")
+        parts.append({
+            "inline_data": {
+                "mime_type": "image/jpeg",
+                "data": b64
             }
-        ]
+        })
+
+    # Call Gemini 2.5 Pro
+    response = model.generate_content(
+        [{"role": "user", "parts": parts}]
     )
 
-    try:
-        data = json.loads(response.text)
-    except Exception:
-        data = {"additional_context": response.text}
-
-    return data
-
-
-
-# ---------------------------------------------------------
-# AGGREGATE RESULTS ACROSS FRAMES
-# ---------------------------------------------------------
-def aggregate_frame_results(frame_results):
-    """
-    Combine multiple frame-level JSON results into a single summary.
-    We use majority voting / most frequent values where possible.
-    """
-    if not frame_results:
-        return {
-            "sport": "unknown",
-            "league": "unknown",
-            "teams": [],
-            "event_type": "unknown",
-            "game_number": "unknown",
-            "approximate_year": "unknown",
-            "score": "unknown",
-            "arena_or_location": "unknown",
-            "broadcaster": "unknown",
-            "series_status": "unknown",
-            "home_team": "unknown",
-            "away_team": "unknown",
-            "star_players": [],
-            "notable_players_with_numbers": [],
-            "additional_context": "",
-            "frames_analyzed": 0
-        }
-
-    # Helper to pick most common non-"unknown" value
-    def most_common(values):
-        filtered = [v for v in values if v and v != "unknown"]
-        if not filtered:
-            return "unknown"
-        return Counter(filtered).most_common(1)[0][0]
-
-    # Collect fields
-    sports = []
-    leagues = []
-    event_types = []
-    game_numbers = []
-    years = []
-    scores = []
-    arenas = []
-    broadcasters = []
-    series_statuses = []
-    home_teams = []
-    away_teams = []
-    all_teams = []
-    all_star_players = []
-    all_notable_players = []
-    all_context = []
-
-    for r in frame_results:
-        sports.append(r.get("sport", "unknown"))
-        leagues.append(r.get("league", "unknown"))
-        event_types.append(r.get("event_type", "unknown"))
-        game_numbers.append(r.get("game_number", "unknown"))
-        years.append(r.get("approximate_year", "unknown"))
-        scores.append(r.get("score", "unknown"))
-        arenas.append(r.get("arena_or_location", "unknown"))
-        broadcasters.append(r.get("broadcaster", "unknown"))
-        series_statuses.append(r.get("series_status", "unknown"))
-        home_teams.append(r.get("home_team", "unknown"))
-        away_teams.append(r.get("away_team", "unknown"))
-
-        teams = r.get("teams", [])
-        if isinstance(teams, list):
-            all_teams.extend(teams)
-
-        stars = r.get("star_players", [])
-        if isinstance(stars, list):
-            all_star_players.extend(stars)
-
-        notable = r.get("notable_players_with_numbers", [])
-        if isinstance(notable, list):
-            all_notable_players.extend(notable)
-
-        ctx = r.get("additional_context", "")
-        if ctx:
-            all_context.append(ctx)
-
-    # Deduplicate teams and players
-    unique_teams = sorted(set([t for t in all_teams if t]))
-    unique_star_players = sorted(set([p for p in all_star_players if p]))
-
-    # For notable players, dedupe by (name, jersey_number, team)
-    seen_notable = set()
-    dedup_notable = []
-    for p in all_notable_players:
-        name = p.get("name", "unknown")
-        num = p.get("jersey_number", "unknown")
-        team = p.get("team", "unknown")
-        key = (name, num, team)
-        if key not in seen_notable:
-            seen_notable.add(key)
-            dedup_notable.append(p)
-
-    summary = {
-        "sport": most_common(sports),
-        "league": most_common(leagues),
-        "teams": unique_teams,
-        "event_type": most_common(event_types),
-        "game_number": most_common(game_numbers),
-        "approximate_year": most_common(years),
-        "score": most_common(scores),
-        "arena_or_location": most_common(arenas),
-        "broadcaster": most_common(broadcasters),
-        "series_status": most_common(series_statuses),
-        "home_team": most_common(home_teams),
-        "away_team": most_common(away_teams),
-        "star_players": unique_star_players,
-        "notable_players_with_numbers": dedup_notable,
-        "additional_context": " ".join(all_context),
-        "frames_analyzed": len(frame_results)
-    }
-
-    return summary
+    # Extract clean JSON
+    return extract_json_from_response(response.text)
 
 
 # ---------------------------------------------------------
@@ -223,11 +161,6 @@ def aggregate_frame_results(frame_results):
 # ---------------------------------------------------------
 def analyze_video(path):
     frames = extract_frames(path, max_frames=6)
-
-    frame_results = []
-    for frame in frames:
-        data = analyze_frame_with_vertex(frame)
-        frame_results.append(data)
-
-    summary = aggregate_frame_results(frame_results)
-    return summary
+    result = analyze_frames_with_vertex(frames)
+    result["frames_analyzed"] = len(frames)
+    return result
